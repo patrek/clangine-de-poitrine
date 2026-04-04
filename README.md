@@ -6,6 +6,7 @@ Music that plays while Claude Code is cooking. Stops when it needs you.
 
 Claude Code hooks trigger shell scripts:
 - `UserPromptSubmit` → `clangine play` (you hit enter, music starts)
+- `PostToolUse` → `clangine play` (resumes after permission was granted)
 - `Stop` → `clangine pause` (Claude finishes, music stops)
 - `Notification` → `clangine pause` (Claude needs your attention)
 - `PermissionRequest` → `clangine pause` (Claude needs permission)

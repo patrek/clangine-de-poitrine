@@ -38,6 +38,10 @@ cmd_play() {
   local state
   state="$(_state)"
 
+  if [[ "$state" == "playing" ]]; then
+    return 0
+  fi
+
   if [[ "$state" == "paused" ]]; then
     _spotify_cmd "play"
     echo "playing" > "$STATE_FILE"
@@ -154,6 +158,17 @@ cmd_install() {
           }
         ]
       }
+    ] |
+    .hooks.PostToolUse = [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ($jp + " play")
+          }
+        ]
+      }
     ]
   ')
 
@@ -162,6 +177,7 @@ cmd_install() {
   echo ""
   echo "Events wired:"
   echo "  UserPromptSubmit   → clangine play"
+  echo "  PostToolUse        → clangine play"
   echo "  Stop               → clangine pause"
   echo "  Notification       → clangine pause"
   echo "  PermissionRequest  → clangine pause"
@@ -186,6 +202,7 @@ cmd_uninstall() {
     del(.hooks.Stop) |
     del(.hooks.Notification) |
     del(.hooks.PermissionRequest) |
+    del(.hooks.PostToolUse) |
     if .hooks == {} then del(.hooks) else . end
   ')
 
@@ -210,6 +227,9 @@ _print_hooks_json() {
     ],
     "PermissionRequest": [
       { "matcher": "", "hooks": [{ "type": "command", "command": "$jp pause" }] }
+    ],
+    "PostToolUse": [
+      { "matcher": "", "hooks": [{ "type": "command", "command": "$jp play" }] }
     ]
   }
 }
