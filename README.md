@@ -1,6 +1,7 @@
 # clangine-de-poitrine
 
-Music that plays while Claude Code is cooking. Stops when it needs you.
+Claude code plays angine de poitrine (Vol. II) on spotify as long as it's running. 
+When the music stops, it means you need to do something (accept permissions, continue prompting, etc)
 
 ## How it works
 
@@ -53,7 +54,3 @@ To get a playlist URI: Spotify → right-click playlist → Share → Copy Spoti
 If no playlist is set, it resumes whatever was last playing. If Spotify isn't open, clangine launches it automatically.
 
 By default it plays [Angine de Poitrine — Vol. II](https://anginedepoitrine.bandcamp.com/).
-
----
-
-*Named after [Angine de Poitrine](https://anginedepoitrine.bandcamp.com/) — microtonal math rock from Saguenay, QC. The perfect coding soundtrack.*
