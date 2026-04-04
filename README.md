@@ -1,4 +1,4 @@
-# clangine-de-poitrine
+# clangine-de-poitrine 🔼
 
 Claude code plays angine de poitrine (Vol. II) on spotify as long as it's running. 
 When the music stops, it means you need to do something (accept permissions, continue prompting, etc)
