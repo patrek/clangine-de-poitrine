@@ -1,0 +1,321 @@
+#!/usr/bin/env bash
+#
+# clangine-de-poitrine — music while Claude Code is cooking
+#
+set -euo pipefail
+
+CLANGINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TRACKS_DIR="$CLANGINE_DIR/tracks"
+STATE_FILE="/tmp/clangine-de-poitrine.state"
+PID_FILE="/tmp/clangine-de-poitrine.pid"
+TRACK_FILE="/tmp/clangine-de-poitrine.track"
+QUEUE_FILE="/tmp/clangine-de-poitrine.queue"
+CONFIG_FILE="$CLANGINE_DIR/config.sh"
+
+# defaults
+CLANGINE_PLAYER="ffplay"
+CLANGINE_VOLUME="0.3"
+CLANGINE_SHUFFLE="true"
+CLANGINE_LOOP="true"
+
+# load user config if exists
+[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
+# --- helpers ---
+
+_state() { cat "$STATE_FILE" 2>/dev/null || echo "stopped"; }
+_pid()   { cat "$PID_FILE" 2>/dev/null || echo ""; }
+
+_is_running() {
+  local pid
+  pid="$(_pid)"
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+_get_tracks() {
+  find "$TRACKS_DIR" -maxdepth 1 -type f \( -name '*.mp3' -o -name '*.wav' -o -name '*.ogg' -o -name '*.flac' -o -name '*.m4a' \) 2>/dev/null | sort
+}
+
+_build_queue() {
+  local tracks
+  tracks="$(_get_tracks)"
+  if [[ -z "$tracks" ]]; then
+    echo "No tracks found in $TRACKS_DIR" >&2
+    return 1
+  fi
+  if [[ "$CLANGINE_SHUFFLE" == "true" ]]; then
+    if command -v shuf &>/dev/null; then
+      echo "$tracks" | shuf > "$QUEUE_FILE"
+    else
+      # macOS: use awk for shuffle (shuf not available)
+      echo "$tracks" | awk 'BEGIN{srand()}{print rand()"\t"$0}' | sort -n | cut -f2- > "$QUEUE_FILE"
+    fi
+  else
+    echo "$tracks" > "$QUEUE_FILE"
+  fi
+}
+
+_next_track() {
+  # pop first line from queue, if empty rebuild
+  if [[ ! -f "$QUEUE_FILE" ]] || [[ ! -s "$QUEUE_FILE" ]]; then
+    if [[ "$CLANGINE_LOOP" == "true" ]]; then
+      _build_queue || return 1
+    else
+      return 1
+    fi
+  fi
+  head -1 "$QUEUE_FILE"
+  tail -n +2 "$QUEUE_FILE" > "$QUEUE_FILE.tmp" && mv "$QUEUE_FILE.tmp" "$QUEUE_FILE"
+}
+
+_start_track() {
+  local track="$1"
+  # kill existing player if any
+  _kill_player 2>/dev/null || true
+
+  # start ffplay in background, no video, no display, loop disabled (we manage queue)
+  local vol
+  vol=$(awk "BEGIN{printf \"%d\", $CLANGINE_VOLUME * 100}")
+  $CLANGINE_PLAYER -nodisp -autoexit -loglevel quiet -volume "$vol" "$track" &
+  local pid=$!
+
+  echo "$pid" > "$PID_FILE"
+  echo "$track" > "$TRACK_FILE"
+  echo "playing" > "$STATE_FILE"
+}
+
+_kill_player() {
+  local pid
+  pid="$(_pid)"
+  if [[ -n "$pid" ]]; then
+    # resume first in case it's stopped (can't kill a stopped process cleanly on some systems)
+    kill -CONT "$pid" 2>/dev/null || true
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  fi
+  rm -f "$PID_FILE"
+}
+
+# --- commands ---
+
+cmd_play() {
+  local state
+  state="$(_state)"
+
+  if [[ "$state" == "paused" ]] && _is_running; then
+    # resume paused playback
+    kill -CONT "$(_pid)" 2>/dev/null
+    echo "playing" > "$STATE_FILE"
+    return 0
+  fi
+
+  # start fresh
+  local track
+  track="$(_next_track)" || { echo "No tracks available. Looked in: $TRACKS_DIR" >&2; echo "Files found: $(_get_tracks | wc -l | tr -d ' ')" >&2; return 1; }
+  _start_track "$track"
+}
+
+cmd_pause() {
+  if [[ "$(_state)" == "playing" ]] && _is_running; then
+    kill -STOP "$(_pid)" 2>/dev/null
+    echo "paused" > "$STATE_FILE"
+  fi
+}
+
+cmd_stop() {
+  _kill_player 2>/dev/null || true
+  echo "stopped" > "$STATE_FILE"
+  rm -f "$QUEUE_FILE" "$TRACK_FILE"
+}
+
+cmd_skip() {
+  local track
+  track="$(_next_track)" || { echo "No more tracks" >&2; return 1; }
+  _start_track "$track"
+}
+
+cmd_status() {
+  local state track
+  state="$(_state)"
+  track="$(cat "$TRACK_FILE" 2>/dev/null || echo "none")"
+
+  echo "state:  $state"
+  echo "track:  $(basename "$track" 2>/dev/null || echo "none")"
+
+  if _is_running; then
+    echo "pid:    $(_pid)"
+  else
+    if [[ "$state" != "stopped" ]]; then
+      echo "pid:    (dead — player exited)"
+      # auto-advance to next track if player finished naturally
+      if [[ "$state" == "playing" ]]; then
+        local next
+        next="$(_next_track 2>/dev/null)" || true
+        if [[ -n "$next" ]]; then
+          echo "advancing to next track..."
+          _start_track "$next"
+        else
+          echo "stopped" > "$STATE_FILE"
+        fi
+      fi
+    fi
+  fi
+
+  local count
+  count="$(_get_tracks | wc -l | tr -d ' ')"
+  echo "tracks: $count in $TRACKS_DIR"
+}
+
+cmd_install() {
+  local settings_file="$HOME/.claude/settings.json"
+  local jukebox_path="$CLANGINE_DIR/clangine"
+
+  # ensure .claude dir exists
+  mkdir -p "$HOME/.claude"
+
+  # read existing settings or start fresh
+  local settings
+  if [[ -f "$settings_file" ]]; then
+    settings="$(cat "$settings_file")"
+  else
+    settings="{}"
+  fi
+
+  # check if jq is available
+  if ! command -v jq &>/dev/null; then
+    echo "jq is required for install. Install it with: brew install jq (macOS) or apt install jq"
+    echo ""
+    echo "Or manually add these hooks to $settings_file:"
+    _print_hooks_json "$jukebox_path"
+    return 1
+  fi
+
+  # build hooks config and merge
+  settings=$(echo "$settings" | jq --arg jp "$jukebox_path" '
+    .hooks.UserPromptSubmit = [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ($jp + " play")
+          }
+        ]
+      }
+    ] |
+    .hooks.Stop = [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ($jp + " pause")
+          }
+        ]
+      }
+    ] |
+    .hooks.Notification = [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ($jp + " pause")
+          }
+        ]
+      }
+    ]
+  ')
+
+  echo "$settings" | jq '.' > "$settings_file"
+  echo "Hooks installed in $settings_file"
+  echo ""
+  echo "Events wired:"
+  echo "  UserPromptSubmit → clangine play"
+  echo "  Stop             → clangine pause"
+  echo "  Notification     → clangine pause"
+  echo ""
+  echo "Drop tracks into $TRACKS_DIR and start a Claude Code session!"
+}
+
+cmd_uninstall() {
+  local settings_file="$HOME/.claude/settings.json"
+
+  if [[ ! -f "$settings_file" ]]; then
+    echo "No settings file found at $settings_file"
+    return 0
+  fi
+
+  if ! command -v jq &>/dev/null; then
+    echo "jq required. Manually remove the hooks from $settings_file"
+    return 1
+  fi
+
+  local settings
+  settings=$(cat "$settings_file" | jq '
+    del(.hooks.UserPromptSubmit) |
+    del(.hooks.Stop) |
+    del(.hooks.Notification) |
+    if .hooks == {} then del(.hooks) else . end
+  ')
+
+  echo "$settings" | jq '.' > "$settings_file"
+  echo "Hooks removed from $settings_file"
+
+  # also stop any running playback
+  cmd_stop 2>/dev/null || true
+}
+
+_print_hooks_json() {
+  local jp="$1"
+  cat <<EOF
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "matcher": "", "hooks": [{ "type": "command", "command": "$jp play" }] }
+    ],
+    "Stop": [
+      { "matcher": "", "hooks": [{ "type": "command", "command": "$jp pause" }] }
+    ],
+    "Notification": [
+      { "matcher": "", "hooks": [{ "type": "command", "command": "$jp pause" }] }
+    ]
+  }
+}
+EOF
+}
+
+# --- main ---
+
+cmd="${1:-help}"
+
+case "$cmd" in
+  play)      cmd_play ;;
+  pause)     cmd_pause ;;
+  stop)      cmd_stop ;;
+  skip)      cmd_skip ;;
+  status)    cmd_status ;;
+  install)   cmd_install ;;
+  uninstall) cmd_uninstall ;;
+  help|--help|-h)
+    echo "clangine-de-poitrine — music while Claude Code is cooking"
+    echo ""
+    echo "Usage: clangine <command>"
+    echo ""
+    echo "Commands:"
+    echo "  play       Start/resume playback"
+    echo "  pause      Pause playback"
+    echo "  stop       Stop and reset"
+    echo "  skip       Next track"
+    echo "  status     Show current state"
+    echo "  install    Add hooks to Claude Code settings"
+    echo "  uninstall  Remove hooks from settings"
+    echo ""
+    echo "Tracks: drop .mp3/.wav/.ogg/.flac/.m4a files into $TRACKS_DIR"
+    ;;
+  *)
+    echo "Unknown command: $cmd" >&2
+    echo "Run 'clangine help' for usage" >&2
+    exit 1
+    ;;
+esac
