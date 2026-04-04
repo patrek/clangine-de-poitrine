@@ -3,7 +3,8 @@
 Claude code plays [Angine de Poitrine — Vol. II](https://anginedepoitrine.bandcamp.com/album/vol-ii) on Spotify as long as it's running. 
 When the music stops, it means you need to do something (accept permissions, continue prompting, etc)
 
-<video src="https://github.com/jerpint/clangine-de-poitrine/raw/main/assets/demo.mp4" width="630" controls></video>
+https://github.com/user-attachments/assets/c0d2b255-a814-4320-a967-1ade247c39c3
+
 
 ## Quick start
 
