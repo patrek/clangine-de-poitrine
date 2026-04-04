@@ -1,13 +1,13 @@
 # clangine-de-poitrine  ✋🔼🤚
 
-Claude code plays angine de poitrine (Vol. II) on spotify as long as it's running. 
+Claude code plays [Angine de Poitrine — Vol. II](https://anginedepoitrine.bandcamp.com/album/vol-ii) on Spotify as long as it's running. 
 When the music stops, it means you need to do something (accept permissions, continue prompting, etc)
 
 ## Quick start
 
 ```bash
 # 1. Install
-git clone <this-repo> ~/.clangine-de-poitrine
+git clone https://github.com/jerpint/clangine-de-poitrine.git ~/.clangine-de-poitrine
 cd ~/.clangine-de-poitrine
 chmod +x clangine
 
