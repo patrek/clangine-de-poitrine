@@ -13,10 +13,12 @@ QUEUE_FILE="/tmp/clangine-de-poitrine.queue"
 CONFIG_FILE="$CLANGINE_DIR/config.sh"
 
 # defaults
+CLANGINE_BACKEND="spotify"   # "spotify" (macOS) or "ffplay" (local files)
 CLANGINE_PLAYER="ffplay"
 CLANGINE_VOLUME="0.3"
 CLANGINE_SHUFFLE="true"
 CLANGINE_LOOP="true"
+CLANGINE_PLAYLIST="spotify:album:3FqqIeynZXFBcyLS9FlWMo"  # Angine de Poitrine — Vol. II
 
 # load user config if exists
 [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
@@ -96,9 +98,87 @@ _kill_player() {
   rm -f "$PID_FILE"
 }
 
+# --- spotify backend ---
+
+_spotify_cmd() {
+  osascript -e "tell application \"Spotify\" to $1" 2>/dev/null
+}
+
+_spotify_is_running() {
+  osascript -e 'tell application "System Events" to (name of processes) contains "Spotify"' 2>/dev/null | grep -q "true"
+}
+
+_spotify_play() {
+  if ! _spotify_is_running; then
+    open -a Spotify
+    # give it a moment to launch
+    sleep 2
+  fi
+
+  local state
+  state="$(_state)"
+
+  if [[ "$state" == "paused" ]]; then
+    _spotify_cmd "play"
+    echo "playing" > "$STATE_FILE"
+    return 0
+  fi
+
+  # start playlist if configured, otherwise just play/resume
+  if [[ -n "$CLANGINE_PLAYLIST" ]]; then
+    _spotify_cmd "play track \"$CLANGINE_PLAYLIST\""
+    if [[ "$CLANGINE_SHUFFLE" == "true" ]]; then
+      _spotify_cmd "set shuffling to true"
+    fi
+  else
+    _spotify_cmd "play"
+  fi
+  echo "playing" > "$STATE_FILE"
+}
+
+_spotify_pause() {
+  if [[ "$(_state)" == "playing" ]]; then
+    _spotify_cmd "pause"
+    echo "paused" > "$STATE_FILE"
+  fi
+}
+
+_spotify_stop() {
+  _spotify_cmd "pause"
+  echo "stopped" > "$STATE_FILE"
+}
+
+_spotify_skip() {
+  _spotify_cmd "next track"
+}
+
+_spotify_status() {
+  local state
+  state="$(_state)"
+  echo "state:    $state"
+  echo "backend:  spotify"
+  if _spotify_is_running; then
+    local track artist
+    track=$(_spotify_cmd "name of current track as string" 2>/dev/null || echo "unknown")
+    artist=$(_spotify_cmd "artist of current track as string" 2>/dev/null || echo "unknown")
+    echo "track:    $track"
+    echo "artist:   $artist"
+    if [[ -n "$CLANGINE_PLAYLIST" ]]; then
+      echo "playlist: $CLANGINE_PLAYLIST"
+    fi
+  else
+    echo "spotify:  not running"
+  fi
+}
+
 # --- commands ---
 
 cmd_play() {
+  if [[ "$CLANGINE_BACKEND" == "spotify" ]]; then
+    _spotify_play
+    return $?
+  fi
+
   local state
   state="$(_state)"
 
@@ -116,6 +196,11 @@ cmd_play() {
 }
 
 cmd_pause() {
+  if [[ "$CLANGINE_BACKEND" == "spotify" ]]; then
+    _spotify_pause
+    return $?
+  fi
+
   if [[ "$(_state)" == "playing" ]] && _is_running; then
     kill -STOP "$(_pid)" 2>/dev/null
     echo "paused" > "$STATE_FILE"
@@ -123,30 +208,46 @@ cmd_pause() {
 }
 
 cmd_stop() {
+  if [[ "$CLANGINE_BACKEND" == "spotify" ]]; then
+    _spotify_stop
+    return $?
+  fi
+
   _kill_player 2>/dev/null || true
   echo "stopped" > "$STATE_FILE"
   rm -f "$QUEUE_FILE" "$TRACK_FILE"
 }
 
 cmd_skip() {
+  if [[ "$CLANGINE_BACKEND" == "spotify" ]]; then
+    _spotify_skip
+    return $?
+  fi
+
   local track
   track="$(_next_track)" || { echo "No more tracks" >&2; return 1; }
   _start_track "$track"
 }
 
 cmd_status() {
+  if [[ "$CLANGINE_BACKEND" == "spotify" ]]; then
+    _spotify_status
+    return $?
+  fi
+
   local state track
   state="$(_state)"
   track="$(cat "$TRACK_FILE" 2>/dev/null || echo "none")"
 
-  echo "state:  $state"
-  echo "track:  $(basename "$track" 2>/dev/null || echo "none")"
+  echo "state:   $state"
+  echo "backend: ffplay"
+  echo "track:   $(basename "$track" 2>/dev/null || echo "none")"
 
   if _is_running; then
-    echo "pid:    $(_pid)"
+    echo "pid:     $(_pid)"
   else
     if [[ "$state" != "stopped" ]]; then
-      echo "pid:    (dead — player exited)"
+      echo "pid:     (dead — player exited)"
       # auto-advance to next track if player finished naturally
       if [[ "$state" == "playing" ]]; then
         local next
@@ -163,7 +264,7 @@ cmd_status() {
 
   local count
   count="$(_get_tracks | wc -l | tr -d ' ')"
-  echo "tracks: $count in $TRACKS_DIR"
+  echo "tracks:  $count in $TRACKS_DIR"
 }
 
 cmd_install() {

@@ -39,12 +39,11 @@ clangine install   # add hooks to ~/.claude/settings.json
 clangine uninstall # remove hooks from settings
 ```
 
-## Requirements
+## Backends
 
-- `ffplay` (comes with ffmpeg) — the audio backend
-- Claude Code CLI
+### ffplay (default)
 
-### Install ffmpeg
+Plays local audio files from `tracks/`. Requires ffmpeg.
 
 ```bash
 # macOS
@@ -52,40 +51,58 @@ brew install ffmpeg
 
 # Ubuntu/Debian
 sudo apt install ffmpeg
-
-# or any other method — we just need ffplay
 ```
+
+Drop .mp3/.wav/.ogg/.flac/.m4a files into `tracks/` and go.
+
+### Spotify (macOS)
+
+Controls the Spotify desktop app via AppleScript. No local files needed.
+
+```bash
+# config.sh
+CLANGINE_BACKEND="spotify"
+CLANGINE_PLAYLIST="spotify:playlist:37i9dQZF1DX..."  # optional
+CLANGINE_SHUFFLE="true"
+```
+
+To get a playlist URI: Spotify → right-click playlist → Share → Copy Spotify URI.
+
+If no playlist is set, it resumes whatever was last playing. If Spotify isn't open, clangine launches it automatically.
 
 ## Configuration
 
-Edit `~/.clangine-de-poitrine/config.sh` (created on first run):
+Create `config.sh` in the clangine directory:
 
 ```bash
-JUKEBOX_PLAYER="ffplay"     # audio player command
-JUKEBOX_VOLUME="0.3"        # 0.0 to 1.0
-JUKEBOX_SHUFFLE="true"      # randomize track order
-JUKEBOX_LOOP="true"         # loop playlist
-```
+# Backend: "ffplay" (local files) or "spotify" (macOS Spotify app)
+CLANGINE_BACKEND="ffplay"
 
-## Adding tracks
+# ffplay settings
+CLANGINE_VOLUME="0.3"        # 0.0 to 1.0
 
-Drop files into `tracks/`:
-```
-tracks/
-  angine-vol1-01.mp3
-  angine-vol2-03.mp3
-  whatever-you-want.ogg
-```
+# Spotify settings
+CLANGINE_PLAYLIST=""          # spotify:playlist:xxx or spotify:album:xxx
 
-Supports: .mp3, .wav, .ogg, .flac, .m4a
+# Shared
+CLANGINE_SHUFFLE="true"      # randomize track order
+CLANGINE_LOOP="true"         # loop playlist (ffplay only)
+```
 
 ## How it works (technical)
 
-The `clangine` script manages an `ffplay` process in the background:
+**ffplay backend:**
+- Manages an `ffplay` process in the background
 - PID tracked in `/tmp/clangine-de-poitrine.pid`
 - State (playing/paused/stopped) in `/tmp/clangine-de-poitrine.state`
 - Pause/resume via SIGSTOP/SIGCONT signals (no restart, no seek loss)
 - Track queue shuffled on startup, advances on finish or skip
+
+**Spotify backend:**
+- Controls Spotify via `osascript` (AppleScript)
+- Play/pause/skip map directly to Spotify commands
+- Auto-launches Spotify if not running
+- Can load a specific playlist on first play
 
 Hooks are simple one-liners in `~/.claude/settings.json` that call `clangine play` or `clangine pause`.
 
