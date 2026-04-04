@@ -10,14 +10,15 @@ CONFIG_FILE="$CLANGINE_DIR/config.sh"
 
 # defaults
 CLANGINE_PLAYLIST="spotify:album:3FqqIeynZXFBcyLS9FlWMo"  # Angine de Poitrine — Vol. II
-CLANGINE_SHUFFLE="true"
+CLANGINE_SHUFFLE="false"
 
 # load user config if exists
 [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
 
 # --- helpers ---
 
-_state() { cat "$STATE_FILE" 2>/dev/null || echo "stopped"; }
+_state() { cut -d: -f1 "$STATE_FILE" 2>/dev/null || echo "stopped"; }
+_album() { cut -d: -f2- "$STATE_FILE" 2>/dev/null || echo ""; }
 
 _spotify_cmd() {
   osascript -e "tell application \"Spotify\" to $1" 2>/dev/null
@@ -43,11 +44,19 @@ cmd_play() {
   fi
 
   if [[ "$state" == "paused" ]]; then
-    _spotify_cmd "play"
-    echo "playing" > "$STATE_FILE"
-    return 0
+    # check if Spotify is still on our album
+    local saved_album current_album
+    saved_album="$(_album)"
+    current_album=$(_spotify_cmd "album of current track as string" || echo "")
+    if [[ -n "$saved_album" && "$current_album" == "$saved_album" ]]; then
+      _spotify_cmd "play"
+      echo "playing:$saved_album" > "$STATE_FILE"
+      return 0
+    fi
+    # different album — fall through to start ours
   fi
 
+  # start our playlist from scratch
   if [[ -n "$CLANGINE_PLAYLIST" ]]; then
     _spotify_cmd "play track \"$CLANGINE_PLAYLIST\""
     if [[ "$CLANGINE_SHUFFLE" == "true" ]]; then
@@ -56,19 +65,21 @@ cmd_play() {
   else
     _spotify_cmd "play"
   fi
-  echo "playing" > "$STATE_FILE"
+  local album
+  album=$(_spotify_cmd "album of current track as string" || echo "")
+  echo "playing:$album" > "$STATE_FILE"
 }
 
 cmd_pause() {
   if [[ "$(_state)" == "playing" ]]; then
     _spotify_cmd "pause"
-    echo "paused" > "$STATE_FILE"
+    echo "paused:$(_album)" > "$STATE_FILE"
   fi
 }
 
 cmd_stop() {
   _spotify_cmd "pause"
-  echo "stopped" > "$STATE_FILE"
+  echo "stopped:" > "$STATE_FILE"
 }
 
 cmd_skip() {
@@ -76,9 +87,11 @@ cmd_skip() {
 }
 
 cmd_status() {
-  local state
+  local state album
   state="$(_state)"
+  album="$(_album)"
   echo "state:    $state"
+  [[ -n "$album" ]] && echo "album:    $album"
   if _spotify_is_running; then
     local track artist
     track=$(_spotify_cmd "name of current track as string" 2>/dev/null || echo "unknown")
