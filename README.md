@@ -30,7 +30,17 @@ Claude Code hooks trigger shell scripts:
 - `Notification` → `clangine pause` (Claude needs your attention)
 - `PermissionRequest` → `clangine pause` (Claude needs permission)
 
-Controls the Spotify desktop app via AppleScript (macOS).
+Controls the Spotify desktop app:
+- **macOS** — via AppleScript (built in, no extra dependencies)
+- **Linux** — via [`playerctl`](https://github.com/altdesktop/playerctl) over MPRIS/D-Bus (works on KDE, GNOME, etc.)
+
+On Linux, install `playerctl` first:
+
+```bash
+sudo apt install playerctl     # Debian/Ubuntu
+sudo pacman -S playerctl       # Arch
+sudo dnf install playerctl     # Fedora
+```
 
 
 ## Configuration
