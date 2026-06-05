@@ -30,6 +30,17 @@ _state() { cut -d: -f1 "$STATE_FILE" 2>/dev/null || echo "stopped"; }
 _album() { cut -d: -f2- "$STATE_FILE" 2>/dev/null || echo ""; }
 _is_enabled() { [[ -f "$ENABLED_FILE" ]]; }
 
+# True when this play hook is reacting to a tool call that was itself a
+# clangine invocation — avoids the PostToolUse hook re-triggering on our
+# own control commands. The hook payload arrives as JSON on stdin; direct
+# (interactive) use has a tty on stdin and is never a self-trigger.
+_is_self_trigger() {
+  [[ -t 0 ]] && return 1
+  local payload
+  payload="$(cat 2>/dev/null || true)"
+  [[ -n "$payload" ]] && grep -qF "clangine-de-poitrine/clangine" <<<"$payload"
+}
+
 # AppleScript bridge (macOS only)
 _osa() {
   osascript -e "tell application \"Spotify\" to $1" 2>/dev/null
@@ -379,7 +390,7 @@ EOF
 cmd="${1:-help}"
 
 case "$cmd" in
-  play)      cmd_play ;;
+  play)      _is_self_trigger && exit 0; cmd_play ;;
   pause)     cmd_pause ;;
   stop)      cmd_stop ;;
   skip)      cmd_skip ;;
