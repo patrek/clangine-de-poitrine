@@ -12,6 +12,7 @@ ENABLED_FILE="$CLANGINE_DIR/.enabled"  # presence = activated
 # defaults
 CLANGINE_PLAYLIST="spotify:album:3FqqIeynZXFBcyLS9FlWMo"  # Angine de Poitrine — Vol. II
 CLANGINE_SHUFFLE="false"
+CLANGINE_PAUSE_ON="stop"  # "stop" = pause on every turn end; "questions" = only when input is needed
 
 # load user config if exists
 [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
@@ -39,6 +40,18 @@ _is_self_trigger() {
   local payload
   payload="$(cat 2>/dev/null || true)"
   [[ -n "$payload" ]] && grep -qF "clangine-de-poitrine/clangine" <<<"$payload"
+}
+
+# True when CLANGINE_PAUSE_ON=questions and this pause hook is reacting to a
+# normal turn end (Stop) — so music keeps playing and only pauses when Claude
+# waits for input (Notification/permission). Direct use (tty) and non-hook
+# callers like cmd_off carry no Stop payload and are unaffected.
+_skip_turn_end_pause() {
+  [[ "$CLANGINE_PAUSE_ON" == "questions" ]] || return 1
+  [[ -t 0 ]] && return 1
+  local payload
+  payload="$(cat 2>/dev/null || true)"
+  grep -qE '"hook_event_name"[[:space:]]*:[[:space:]]*"Stop"' <<<"$payload"
 }
 
 # AppleScript bridge (macOS only)
@@ -391,7 +404,7 @@ cmd="${1:-help}"
 
 case "$cmd" in
   play)      _is_self_trigger && exit 0; cmd_play ;;
-  pause)     cmd_pause ;;
+  pause)     _skip_turn_end_pause && exit 0; cmd_pause ;;
   stop)      cmd_stop ;;
   skip)      cmd_skip ;;
   on)        cmd_on ;;

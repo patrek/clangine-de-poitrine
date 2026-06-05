@@ -50,6 +50,8 @@ Create `config.sh` in the clangine directory:
 ```bash
 CLANGINE_PLAYLIST="spotify:playlist:37i9dQZF1DX..."  # playlist or album URI
 CLANGINE_SHUFFLE="true"                               # randomize track order
+CLANGINE_PAUSE_ON="questions"                         # "stop" (default): pause every turn end
+                                                      # "questions": only pause when Claude needs input
 ```
 
 To get a playlist URI: Spotify → right-click playlist → Share → Copy Spotify URI.
