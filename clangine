@@ -31,27 +31,28 @@ _state() { cut -d: -f1 "$STATE_FILE" 2>/dev/null || echo "stopped"; }
 _album() { cut -d: -f2- "$STATE_FILE" 2>/dev/null || echo ""; }
 _is_enabled() { [[ -f "$ENABLED_FILE" ]]; }
 
-# True when this play hook is reacting to a tool call that was itself a
-# clangine invocation — avoids the PostToolUse hook re-triggering on our
-# own control commands. The hook payload arrives as JSON on stdin; direct
-# (interactive) use has a tty on stdin and is never a self-trigger.
-_is_self_trigger() {
-  [[ -t 0 ]] && return 1
-  local payload
-  payload="$(cat 2>/dev/null || true)"
-  [[ -n "$payload" ]] && grep -qF "clangine-de-poitrine/clangine" <<<"$payload"
+# Read a Claude Code hook payload from stdin. Empty when run interactively
+# (tty) or invoked without a hook. stdin can only be consumed once, so the
+# dispatch reads it here and passes the result to the predicates below.
+_read_payload() {
+  [[ -t 0 ]] && return 0
+  cat 2>/dev/null || true
 }
+
+# True when stdin carried a hook payload (vs an explicit, typed invocation).
+_from_hook() { grep -q '"hook_event_name"' <<<"$1"; }
+
+# True when a play hook is reacting to a tool call that was itself a clangine
+# invocation — avoids the PostToolUse hook re-triggering on our own commands.
+_is_self_trigger() { grep -qF "clangine-de-poitrine/clangine" <<<"$1"; }
 
 # True when CLANGINE_PAUSE_ON=questions and this pause hook is reacting to a
 # normal turn end (Stop) — so music keeps playing and only pauses when Claude
-# waits for input (Notification/permission). Direct use (tty) and non-hook
-# callers like cmd_off carry no Stop payload and are unaffected.
+# waits for input (Notification/permission). Direct use and non-hook callers
+# like cmd_off carry no Stop payload and are unaffected.
 _skip_turn_end_pause() {
   [[ "$CLANGINE_PAUSE_ON" == "questions" ]] || return 1
-  [[ -t 0 ]] && return 1
-  local payload
-  payload="$(cat 2>/dev/null || true)"
-  grep -qE '"hook_event_name"[[:space:]]*:[[:space:]]*"Stop"' <<<"$payload"
+  grep -qE '"hook_event_name"[[:space:]]*:[[:space:]]*"Stop"' <<<"$1"
 }
 
 # AppleScript bridge (macOS only)
@@ -188,6 +189,23 @@ cmd_play() {
   local album
   album=$(_player_meta album || echo "")
   echo "playing:$album" > "$STATE_FILE"
+}
+
+# Passive resume for hook-driven play: never launches Spotify and never starts
+# a playlist — it only resumes a playback that clangine itself paused on a
+# still-running Spotify. Explicit play/on use cmd_play instead.
+cmd_resume() {
+  _is_enabled || return 0
+  _ensure_player
+  _player_running || return 0
+  [[ "$(_state)" == "paused" ]] || return 0
+  local saved_album current_album
+  saved_album="$(_album)"
+  current_album=$(_player_meta album || echo "")
+  if [[ -z "$saved_album" || "$current_album" == "$saved_album" ]]; then
+    _player_play
+    echo "playing:$saved_album" > "$STATE_FILE"
+  fi
 }
 
 cmd_pause() {
@@ -403,8 +421,16 @@ EOF
 cmd="${1:-help}"
 
 case "$cmd" in
-  play)      _is_self_trigger && exit 0; cmd_play ;;
-  pause)     _skip_turn_end_pause && exit 0; cmd_pause ;;
+  play)
+    payload="$(_read_payload)"
+    _is_self_trigger "$payload" && exit 0
+    if _from_hook "$payload"; then cmd_resume; else cmd_play; fi
+    ;;
+  pause)
+    payload="$(_read_payload)"
+    _skip_turn_end_pause "$payload" && exit 0
+    cmd_pause
+    ;;
   stop)      cmd_stop ;;
   skip)      cmd_skip ;;
   on)        cmd_on ;;

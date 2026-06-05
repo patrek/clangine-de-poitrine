@@ -56,6 +56,6 @@ CLANGINE_PAUSE_ON="questions"                         # "stop" (default): pause 
 
 To get a playlist URI: Spotify → right-click playlist → Share → Copy Spotify URI.
 
-If no playlist is set, it resumes whatever was last playing. If Spotify isn't open, clangine launches it automatically.
+If no playlist is set, it resumes whatever was last playing. Only an explicit `clangine on` / `clangine play` will launch Spotify if it isn't open — the automatic hooks never start Spotify on their own. While Claude works, clangine only resumes a playback it paused itself; if Spotify is closed or you're playing music manually, it stays out of the way.
 
 By default it plays [Angine de Poitrine — Vol. II](https://anginedepoitrine.bandcamp.com/).
