@@ -1,1 +1,7 @@
 tracks/
+
+# user-local config
+config.sh
+
+# activation flag
+.enabled

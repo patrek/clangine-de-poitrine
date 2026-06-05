@@ -7,32 +7,151 @@ set -euo pipefail
 CLANGINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE_FILE="/tmp/clangine-de-poitrine.state"
 CONFIG_FILE="$CLANGINE_DIR/config.sh"
+ENABLED_FILE="$CLANGINE_DIR/.enabled"  # presence = activated
 
 # defaults
 CLANGINE_PLAYLIST="spotify:album:3FqqIeynZXFBcyLS9FlWMo"  # Angine de Poitrine — Vol. II
 CLANGINE_SHUFFLE="false"
+CLANGINE_PAUSE_ON="stop"  # "stop" = pause on every turn end; "questions" = only when input is needed
 
 # load user config if exists
 [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
+# --- platform detection ---
+
+case "$(uname -s)" in
+  Darwin) CLANGINE_OS="macos" ;;
+  Linux)  CLANGINE_OS="linux" ;;
+  *)      CLANGINE_OS="unknown" ;;
+esac
 
 # --- helpers ---
 
 _state() { cut -d: -f1 "$STATE_FILE" 2>/dev/null || echo "stopped"; }
 _album() { cut -d: -f2- "$STATE_FILE" 2>/dev/null || echo ""; }
+_is_enabled() { [[ -f "$ENABLED_FILE" ]]; }
 
-_spotify_cmd() {
+# Read a Claude Code hook payload from stdin. Empty when run interactively
+# (tty) or invoked without a hook. stdin can only be consumed once, so the
+# dispatch reads it here and passes the result to the predicates below.
+_read_payload() {
+  [[ -t 0 ]] && return 0
+  cat 2>/dev/null || true
+}
+
+# True when stdin carried a hook payload (vs an explicit, typed invocation).
+_from_hook() { grep -q '"hook_event_name"' <<<"$1"; }
+
+# True when a play hook is reacting to a tool call that was itself a clangine
+# invocation — avoids the PostToolUse hook re-triggering on our own commands.
+_is_self_trigger() { grep -qF "clangine-de-poitrine/clangine" <<<"$1"; }
+
+# True when CLANGINE_PAUSE_ON=questions and this pause hook is reacting to a
+# normal turn end (Stop) — so music keeps playing and only pauses when Claude
+# waits for input (Notification/permission). Direct use and non-hook callers
+# like cmd_off carry no Stop payload and are unaffected.
+_skip_turn_end_pause() {
+  [[ "$CLANGINE_PAUSE_ON" == "questions" ]] || return 1
+  grep -qE '"hook_event_name"[[:space:]]*:[[:space:]]*"Stop"' <<<"$1"
+}
+
+# AppleScript bridge (macOS only)
+_osa() {
   osascript -e "tell application \"Spotify\" to $1" 2>/dev/null
 }
 
-_spotify_is_running() {
-  osascript -e 'tell application "System Events" to (name of processes) contains "Spotify"' 2>/dev/null | grep -q "true"
+# Abort early with a helpful message if the platform can't be driven.
+_ensure_player() {
+  case "$CLANGINE_OS" in
+    macos) ;;
+    linux)
+      if ! command -v playerctl &>/dev/null; then
+        echo "clangine: playerctl is required on Linux." >&2
+        echo "  Install it with: sudo apt install playerctl   (or: sudo pacman -S playerctl)" >&2
+        exit 1
+      fi
+      ;;
+    *)
+      echo "clangine: unsupported platform ($(uname -s))" >&2
+      exit 1
+      ;;
+  esac
+}
+
+# --- player abstraction (dispatches on OS) ---
+
+_player_running() {
+  case "$CLANGINE_OS" in
+    macos) osascript -e 'tell application "System Events" to (name of processes) contains "Spotify"' 2>/dev/null | grep -q "true" ;;
+    linux) pgrep -x spotify >/dev/null 2>&1 ;;
+  esac
+}
+
+_player_launch() {
+  case "$CLANGINE_OS" in
+    macos) open -a Spotify ;;
+    linux) (spotify >/dev/null 2>&1 &) ;;
+  esac
+}
+
+_player_play() {
+  case "$CLANGINE_OS" in
+    macos) _osa "play" ;;
+    linux) playerctl -p spotify play 2>/dev/null ;;
+  esac
+}
+
+_player_pause() {
+  case "$CLANGINE_OS" in
+    macos) _osa "pause" ;;
+    linux) playerctl -p spotify pause 2>/dev/null ;;
+  esac
+}
+
+_player_next() {
+  case "$CLANGINE_OS" in
+    macos) _osa "next track" ;;
+    linux) playerctl -p spotify next 2>/dev/null ;;
+  esac
+}
+
+_player_play_uri() {
+  case "$CLANGINE_OS" in
+    macos) _osa "play track \"$1\"" ;;
+    linux) playerctl -p spotify open "$1" 2>/dev/null ;;
+  esac
+}
+
+_player_shuffle() {
+  case "$CLANGINE_OS" in
+    macos) _osa "set shuffling to $1" ;;
+    linux) playerctl -p spotify shuffle "$([[ "$1" == "true" ]] && echo on || echo off)" 2>/dev/null ;;
+  esac
+}
+
+# _player_meta <album|name|artist>
+_player_meta() {
+  case "$CLANGINE_OS" in
+    macos) _osa "$1 of current track as string" ;;
+    linux)
+      local field
+      case "$1" in
+        album)  field="xesam:album" ;;
+        name)   field="xesam:title" ;;
+        artist) field="xesam:artist" ;;
+      esac
+      playerctl -p spotify metadata "$field" 2>/dev/null
+      ;;
+  esac
 }
 
 # --- commands ---
 
 cmd_play() {
-  if ! _spotify_is_running; then
-    open -a Spotify
+  _is_enabled || return 0
+  _ensure_player
+  if ! _player_running; then
+    _player_launch
     sleep 2
   fi
 
@@ -47,9 +166,9 @@ cmd_play() {
     # check if Spotify is still on our album
     local saved_album current_album
     saved_album="$(_album)"
-    current_album=$(_spotify_cmd "album of current track as string" || echo "")
+    current_album=$(_player_meta album || echo "")
     if [[ -n "$saved_album" && "$current_album" == "$saved_album" ]]; then
-      _spotify_cmd "play"
+      _player_play
       echo "playing:$saved_album" > "$STATE_FILE"
       return 0
     fi
@@ -58,44 +177,92 @@ cmd_play() {
 
   # start our playlist from scratch
   if [[ -n "$CLANGINE_PLAYLIST" ]]; then
-    _spotify_cmd "play track \"$CLANGINE_PLAYLIST\""
+    _player_play_uri "$CLANGINE_PLAYLIST"
     if [[ "$CLANGINE_SHUFFLE" == "true" ]]; then
-      _spotify_cmd "set shuffling to true"
+      _player_shuffle true
     fi
+    # OpenUri is async over D-Bus; let Spotify switch tracks before we read metadata
+    [[ "$CLANGINE_OS" == "linux" ]] && sleep 1
   else
-    _spotify_cmd "play"
+    _player_play
   fi
   local album
-  album=$(_spotify_cmd "album of current track as string" || echo "")
+  album=$(_player_meta album || echo "")
   echo "playing:$album" > "$STATE_FILE"
 }
 
+# Passive resume for hook-driven play: never launches Spotify and never starts
+# a playlist — it only resumes a playback that clangine itself paused on a
+# still-running Spotify. Explicit play/on use cmd_play instead.
+cmd_resume() {
+  _is_enabled || return 0
+  _ensure_player
+  _player_running || return 0
+  [[ "$(_state)" == "paused" ]] || return 0
+  local saved_album current_album
+  saved_album="$(_album)"
+  current_album=$(_player_meta album || echo "")
+  if [[ -z "$saved_album" || "$current_album" == "$saved_album" ]]; then
+    _player_play
+    echo "playing:$saved_album" > "$STATE_FILE"
+  fi
+}
+
 cmd_pause() {
+  _is_enabled || return 0
+  _ensure_player
   if [[ "$(_state)" == "playing" ]]; then
-    _spotify_cmd "pause"
+    _player_pause
     echo "paused:$(_album)" > "$STATE_FILE"
   fi
 }
 
 cmd_stop() {
-  _spotify_cmd "pause"
+  _ensure_player
+  _player_pause
   echo "stopped:" > "$STATE_FILE"
 }
 
 cmd_skip() {
-  _spotify_cmd "next track"
+  _ensure_player
+  _player_next
+}
+
+cmd_on() {
+  touch "$ENABLED_FILE"
+  echo "clangine activated — music will play while Claude Code works"
+  cmd_play
+}
+
+cmd_off() {
+  rm -f "$ENABLED_FILE"
+  if _player_running 2>/dev/null; then
+    _player_pause 2>/dev/null || true
+  fi
+  echo "stopped:" > "$STATE_FILE"
+  echo "clangine deactivated — Spotify will be left alone"
+}
+
+cmd_toggle() {
+  if _is_enabled; then
+    cmd_off
+  else
+    cmd_on
+  fi
 }
 
 cmd_status() {
+  _ensure_player
   local state album
   state="$(_state)"
   album="$(_album)"
+  echo "active:   $(_is_enabled && echo yes || echo no)"
   echo "state:    $state"
   [[ -n "$album" ]] && echo "album:    $album"
-  if _spotify_is_running; then
+  if _player_running; then
     local track artist
-    track=$(_spotify_cmd "name of current track as string" 2>/dev/null || echo "unknown")
-    artist=$(_spotify_cmd "artist of current track as string" 2>/dev/null || echo "unknown")
+    track=$(_player_meta name 2>/dev/null || echo "unknown")
+    artist=$(_player_meta artist 2>/dev/null || echo "unknown")
     echo "track:    $track"
     echo "artist:   $artist"
     if [[ -n "$CLANGINE_PLAYLIST" ]]; then
@@ -254,10 +421,21 @@ EOF
 cmd="${1:-help}"
 
 case "$cmd" in
-  play)      cmd_play ;;
-  pause)     cmd_pause ;;
+  play)
+    payload="$(_read_payload)"
+    _is_self_trigger "$payload" && exit 0
+    if _from_hook "$payload"; then cmd_resume; else cmd_play; fi
+    ;;
+  pause)
+    payload="$(_read_payload)"
+    _skip_turn_end_pause "$payload" && exit 0
+    cmd_pause
+    ;;
   stop)      cmd_stop ;;
   skip)      cmd_skip ;;
+  on)        cmd_on ;;
+  off)       cmd_off ;;
+  toggle)    cmd_toggle ;;
   status)    cmd_status ;;
   install)   cmd_install ;;
   uninstall) cmd_uninstall ;;
@@ -267,6 +445,9 @@ case "$cmd" in
     echo "Usage: clangine <command>"
     echo ""
     echo "Commands:"
+    echo "  on         Activate (music plays while Claude Code works)"
+    echo "  off        Deactivate (Spotify is left alone)"
+    echo "  toggle     Toggle activation"
     echo "  play       Start/resume playback"
     echo "  pause      Pause playback"
     echo "  stop       Stop and reset"
