@@ -7,6 +7,7 @@ set -euo pipefail
 CLANGINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE_FILE="/tmp/clangine-de-poitrine.state"
 CONFIG_FILE="$CLANGINE_DIR/config.sh"
+ENABLED_FILE="$CLANGINE_DIR/.enabled"  # presence = activated
 
 # defaults
 CLANGINE_PLAYLIST="spotify:album:3FqqIeynZXFBcyLS9FlWMo"  # Angine de Poitrine — Vol. II
@@ -27,6 +28,7 @@ esac
 
 _state() { cut -d: -f1 "$STATE_FILE" 2>/dev/null || echo "stopped"; }
 _album() { cut -d: -f2- "$STATE_FILE" 2>/dev/null || echo ""; }
+_is_enabled() { [[ -f "$ENABLED_FILE" ]]; }
 
 # AppleScript bridge (macOS only)
 _osa() {
@@ -121,6 +123,7 @@ _player_meta() {
 # --- commands ---
 
 cmd_play() {
+  _is_enabled || return 0
   _ensure_player
   if ! _player_running; then
     _player_launch
@@ -164,6 +167,7 @@ cmd_play() {
 }
 
 cmd_pause() {
+  _is_enabled || return 0
   _ensure_player
   if [[ "$(_state)" == "playing" ]]; then
     _player_pause
@@ -182,11 +186,35 @@ cmd_skip() {
   _player_next
 }
 
+cmd_on() {
+  touch "$ENABLED_FILE"
+  echo "clangine activated — music will play while Claude Code works"
+  cmd_play
+}
+
+cmd_off() {
+  rm -f "$ENABLED_FILE"
+  if _player_running 2>/dev/null; then
+    _player_pause 2>/dev/null || true
+  fi
+  echo "stopped:" > "$STATE_FILE"
+  echo "clangine deactivated — Spotify will be left alone"
+}
+
+cmd_toggle() {
+  if _is_enabled; then
+    cmd_off
+  else
+    cmd_on
+  fi
+}
+
 cmd_status() {
   _ensure_player
   local state album
   state="$(_state)"
   album="$(_album)"
+  echo "active:   $(_is_enabled && echo yes || echo no)"
   echo "state:    $state"
   [[ -n "$album" ]] && echo "album:    $album"
   if _player_running; then
@@ -355,6 +383,9 @@ case "$cmd" in
   pause)     cmd_pause ;;
   stop)      cmd_stop ;;
   skip)      cmd_skip ;;
+  on)        cmd_on ;;
+  off)       cmd_off ;;
+  toggle)    cmd_toggle ;;
   status)    cmd_status ;;
   install)   cmd_install ;;
   uninstall) cmd_uninstall ;;
@@ -364,6 +395,9 @@ case "$cmd" in
     echo "Usage: clangine <command>"
     echo ""
     echo "Commands:"
+    echo "  on         Activate (music plays while Claude Code works)"
+    echo "  off        Deactivate (Spotify is left alone)"
+    echo "  toggle     Toggle activation"
     echo "  play       Start/resume playback"
     echo "  pause      Pause playback"
     echo "  stop       Stop and reset"
