@@ -5,7 +5,9 @@
 set -euo pipefail
 
 CLANGINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-STATE_FILE="/tmp/clangine-de-poitrine.state"
+# Per-user runtime dir (Linux tmpfs, mode 0700) rather than a shared /tmp path.
+STATE_DIR="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}"
+STATE_FILE="${STATE_DIR%/}/clangine-de-poitrine.state"
 CONFIG_FILE="$CLANGINE_DIR/config.sh"
 ENABLED_FILE="$CLANGINE_DIR/.enabled"  # presence = activated
 
@@ -13,9 +15,13 @@ ENABLED_FILE="$CLANGINE_DIR/.enabled"  # presence = activated
 CLANGINE_PLAYLIST="spotify:album:3FqqIeynZXFBcyLS9FlWMo"  # Angine de Poitrine — Vol. II
 CLANGINE_SHUFFLE="false"
 CLANGINE_PAUSE_ON="stop"  # "stop" = pause on every turn end; "questions" = only when input is needed
+CLANGINE_PLAYER="spotify" # Linux only: MPRIS player name (see `playerctl -l`)
 
 # load user config if exists
 [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
+# Set by the dispatch when invoked from a Claude Code hook.
+CLANGINE_HOOK=0
 
 # --- platform detection ---
 
@@ -27,8 +33,18 @@ esac
 
 # --- helpers ---
 
-_state() { cut -d: -f1 "$STATE_FILE" 2>/dev/null || echo "stopped"; }
-_album() { cut -d: -f2- "$STATE_FILE" 2>/dev/null || echo ""; }
+# State file holds "state:album", e.g. "playing:Vol. II".
+_state() {
+  local state="" album=""
+  [[ -f "$STATE_FILE" ]] && IFS=: read -r state album < "$STATE_FILE" || true
+  echo "${state:-stopped}"
+}
+_album() {
+  local state="" album=""
+  [[ -f "$STATE_FILE" ]] && IFS=: read -r state album < "$STATE_FILE" || true
+  echo "$album"
+}
+_set_state() { printf '%s:%s\n' "$1" "${2:-}" > "$STATE_FILE"; }
 _is_enabled() { [[ -f "$ENABLED_FILE" ]]; }
 
 # Read a Claude Code hook payload from stdin. Empty when run interactively
@@ -39,12 +55,15 @@ _read_payload() {
   cat 2>/dev/null || true
 }
 
+# The predicates below run on every PostToolUse, so they stick to bash
+# builtins instead of spawning grep.
+
 # True when stdin carried a hook payload (vs an explicit, typed invocation).
-_from_hook() { grep -q '"hook_event_name"' <<<"$1"; }
+_from_hook() { [[ "$1" == *'"hook_event_name"'* ]]; }
 
 # True when a play hook is reacting to a tool call that was itself a clangine
 # invocation — avoids the PostToolUse hook re-triggering on our own commands.
-_is_self_trigger() { grep -qF "clangine-de-poitrine/clangine" <<<"$1"; }
+_is_self_trigger() { [[ "$1" == *"clangine-de-poitrine/clangine"* ]]; }
 
 # True when CLANGINE_PAUSE_ON=questions and this pause hook is reacting to a
 # normal turn end (Stop) — so music keeps playing and only pauses when Claude
@@ -52,7 +71,8 @@ _is_self_trigger() { grep -qF "clangine-de-poitrine/clangine" <<<"$1"; }
 # like cmd_off carry no Stop payload and are unaffected.
 _skip_turn_end_pause() {
   [[ "$CLANGINE_PAUSE_ON" == "questions" ]] || return 1
-  grep -qE '"hook_event_name"[[:space:]]*:[[:space:]]*"Stop"' <<<"$1"
+  local stop_event='"hook_event_name"[[:space:]]*:[[:space:]]*"Stop"'
+  [[ "$1" =~ $stop_event ]]
 }
 
 # AppleScript bridge (macOS only)
@@ -60,18 +80,25 @@ _osa() {
   osascript -e "tell application \"Spotify\" to $1" 2>/dev/null
 }
 
+# playerctl bridge (Linux only)
+_pctl() {
+  playerctl -p "$CLANGINE_PLAYER" "$@" 2>/dev/null
+}
+
 # Abort early with a helpful message if the platform can't be driven.
 _ensure_player() {
   case "$CLANGINE_OS" in
     macos) ;;
     linux)
-      if ! command -v playerctl &>/dev/null; then
-        echo "clangine: playerctl is required on Linux." >&2
-        echo "  Install it with: sudo apt install playerctl   (or: sudo pacman -S playerctl)" >&2
-        exit 1
-      fi
+      command -v playerctl &>/dev/null && return 0
+      # hooks fire on every tool call: stay silent instead of erroring each time
+      [[ "$CLANGINE_HOOK" == 1 ]] && exit 0
+      echo "clangine: playerctl is required on Linux." >&2
+      echo "  Install it with: sudo apt install playerctl   (or: sudo pacman -S playerctl)" >&2
+      exit 1
       ;;
     *)
+      [[ "$CLANGINE_HOOK" == 1 ]] && exit 0
       echo "clangine: unsupported platform ($(uname -s))" >&2
       exit 1
       ;;
@@ -80,69 +107,149 @@ _ensure_player() {
 
 # --- player abstraction (dispatches on OS) ---
 
+# True when the player can actually be controlled. On Linux this asks MPRIS
+# rather than pgrep: Spotify's process exists a few seconds before it is
+# reachable over D-Bus, and D-Bus may be unreachable altogether (SSH, containers).
 _player_running() {
   case "$CLANGINE_OS" in
     macos) osascript -e 'tell application "System Events" to (name of processes) contains "Spotify"' 2>/dev/null | grep -q "true" ;;
-    linux) pgrep -x spotify >/dev/null 2>&1 ;;
+    linux) _pctl status >/dev/null ;;
   esac
 }
 
 _player_launch() {
   case "$CLANGINE_OS" in
     macos) open -a Spotify ;;
-    linux) (spotify >/dev/null 2>&1 &) ;;
+    linux)
+      if [[ "$CLANGINE_PLAYER" != "spotify" ]]; then
+        echo "clangine: $CLANGINE_PLAYER is not running — start it first" >&2
+        return 1
+      fi
+      # already starting up, just not on D-Bus yet
+      pgrep -x spotify >/dev/null && return 0
+      local launcher=()
+      if command -v spotify &>/dev/null; then
+        launcher=(spotify)
+      elif command -v flatpak &>/dev/null && flatpak info com.spotify.Client &>/dev/null; then
+        launcher=(flatpak run com.spotify.Client)
+      else
+        echo "clangine: Spotify not found (tried 'spotify' and flatpak com.spotify.Client)" >&2
+        return 1
+      fi
+      # fully detached so it outlives the shell (or hook) that launched it
+      setsid -f "${launcher[@]}" </dev/null >/dev/null 2>&1
+      ;;
+  esac
+}
+
+# Wait until a freshly launched player accepts commands.
+_player_wait_ready() {
+  case "$CLANGINE_OS" in
+    macos) sleep 2 ;;
+    linux)
+      local i
+      for ((i = 0; i < 50; i++)); do
+        _player_running && return 0
+        sleep 0.2
+      done
+      echo "clangine: $CLANGINE_PLAYER did not show up on D-Bus (check: playerctl -l)" >&2
+      return 1
+      ;;
   esac
 }
 
 _player_play() {
   case "$CLANGINE_OS" in
     macos) _osa "play" ;;
-    linux) playerctl -p spotify play 2>/dev/null ;;
+    linux) _pctl play ;;
   esac
 }
 
 _player_pause() {
   case "$CLANGINE_OS" in
     macos) _osa "pause" ;;
-    linux) playerctl -p spotify pause 2>/dev/null ;;
+    linux) _pctl pause ;;
   esac
 }
 
 _player_next() {
   case "$CLANGINE_OS" in
     macos) _osa "next track" ;;
-    linux) playerctl -p spotify next 2>/dev/null ;;
+    linux) _pctl next ;;
   esac
 }
 
 _player_play_uri() {
   case "$CLANGINE_OS" in
     macos) _osa "play track \"$1\"" ;;
-    linux) playerctl -p spotify open "$1" 2>/dev/null ;;
+    linux) _pctl open "$1" ;;
   esac
 }
 
 _player_shuffle() {
   case "$CLANGINE_OS" in
     macos) _osa "set shuffling to $1" ;;
-    linux) playerctl -p spotify shuffle "$([[ "$1" == "true" ]] && echo on || echo off)" 2>/dev/null ;;
+    linux) _pctl shuffle "$([[ "$1" == "true" ]] && echo on || echo off)" ;;
   esac
 }
 
-# _player_meta <album|name|artist>
+# Prints playing / paused / stopped, or nothing when the player isn't running.
+_player_status() {
+  local status=""
+  case "$CLANGINE_OS" in
+    # guard: any "tell application" would launch Spotify if it's closed
+    macos) _player_running && status=$(_osa "player state as string" || true) ;;
+    linux) status=$(_pctl status || true) ;;
+  esac
+  echo "$status" | tr '[:upper:]' '[:lower:]'
+}
+
+_player_is_playing() { [[ "$(_player_status)" == "playing" ]]; }
+
+# Play and make sure it took: right after launch Spotify can already be on
+# D-Bus while still loading its session, and rejects Play for a moment.
+_player_start() {
+  local i
+  for ((i = 0; i < 25; i++)); do
+    _player_play || true
+    _player_is_playing && return 0
+    sleep 0.2
+  done
+  echo "clangine: $CLANGINE_PLAYER did not start playing" >&2
+  return 1
+}
+
+# _player_meta <album|name|artist|trackid>
 _player_meta() {
   case "$CLANGINE_OS" in
-    macos) _osa "$1 of current track as string" ;;
+    macos)
+      case "$1" in
+        trackid) _osa "id of current track as string" ;;
+        *)       _osa "$1 of current track as string" ;;
+      esac
+      ;;
     linux)
       local field
       case "$1" in
-        album)  field="xesam:album" ;;
-        name)   field="xesam:title" ;;
-        artist) field="xesam:artist" ;;
+        album)   field="xesam:album" ;;
+        name)    field="xesam:title" ;;
+        artist)  field="xesam:artist" ;;
+        trackid) field="mpris:trackid" ;;
       esac
-      playerctl -p spotify metadata "$field" 2>/dev/null
+      _pctl metadata "$field"
       ;;
   esac
+}
+
+# OpenUri is async over D-Bus: wait (up to ~3s) for the track to change so the
+# album we record is the new one, not whatever was playing before.
+_player_wait_track_change() {
+  [[ "$CLANGINE_OS" == "linux" ]] || return 0
+  local i
+  for ((i = 0; i < 15; i++)); do
+    [[ "$(_player_meta trackid || true)" != "$1" ]] && return 0
+    sleep 0.2
+  done
 }
 
 # --- commands ---
@@ -152,24 +259,21 @@ cmd_play() {
   _ensure_player
   if ! _player_running; then
     _player_launch
-    sleep 2
+    _player_wait_ready
   fi
 
   local state
   state="$(_state)"
 
-  if [[ "$state" == "playing" ]]; then
-    return 0
-  fi
-
-  if [[ "$state" == "paused" ]]; then
+  # "playing"/"held" too: the user may have paused it by hand since
+  if [[ "$state" == "playing" || "$state" == "paused" || "$state" == "held" ]]; then
     # check if Spotify is still on our album
     local saved_album current_album
     saved_album="$(_album)"
-    current_album=$(_player_meta album || echo "")
+    current_album=$(_player_meta album || true)
     if [[ -n "$saved_album" && "$current_album" == "$saved_album" ]]; then
-      _player_play
-      echo "playing:$saved_album" > "$STATE_FILE"
+      _player_is_playing || _player_start
+      _set_state playing "$saved_album"
       return 0
     fi
     # different album — fall through to start ours
@@ -177,54 +281,90 @@ cmd_play() {
 
   # start our playlist from scratch
   if [[ -n "$CLANGINE_PLAYLIST" ]]; then
-    _player_play_uri "$CLANGINE_PLAYLIST"
-    if [[ "$CLANGINE_SHUFFLE" == "true" ]]; then
-      _player_shuffle true
+    local previous_track
+    previous_track=$(_player_meta trackid || true)
+    if ! _player_play_uri "$CLANGINE_PLAYLIST"; then
+      echo "clangine: could not open $CLANGINE_PLAYLIST" >&2
+      return 1
     fi
-    # OpenUri is async over D-Bus; let Spotify switch tracks before we read metadata
-    [[ "$CLANGINE_OS" == "linux" ]] && sleep 1
+    _player_wait_track_change "$previous_track"
+    _player_start
+    if [[ "$CLANGINE_SHUFFLE" == "true" ]] && ! _player_shuffle true; then
+      echo "clangine: shuffle not supported by $CLANGINE_PLAYER, playing in order" >&2
+    fi
   else
-    _player_play
+    _player_start
   fi
-  local album
-  album=$(_player_meta album || echo "")
-  echo "playing:$album" > "$STATE_FILE"
+  _set_state playing "$(_player_meta album || true)"
 }
 
-# Passive resume for hook-driven play: never launches Spotify and never starts
-# a playlist — it only resumes a playback that clangine itself paused on a
-# still-running Spotify. Explicit play/on use cmd_play instead.
+# Passive resume for hook-driven play: never launches Spotify and never opens
+# the playlist. It resumes a playback clangine paused, follows the user when
+# they press play after a manual pause, and starts what's loaded when clangine
+# isn't driving anything yet. Explicit play/on use cmd_play instead.
 cmd_resume() {
   _is_enabled || return 0
+  local state
+  state="$(_state)"
+  # cheap check first: this runs on every tool call
+  [[ "$state" == "playing" ]] && return 0
   _ensure_player
   _player_running || return 0
-  [[ "$(_state)" == "paused" ]] || return 0
-  local saved_album current_album
-  saved_album="$(_album)"
-  current_album=$(_player_meta album || echo "")
-  if [[ -z "$saved_album" || "$current_album" == "$saved_album" ]]; then
-    _player_play
-    echo "playing:$saved_album" > "$STATE_FILE"
-  fi
+  case "$state" in
+    paused)
+      # only resume what we paused: bail if the user switched albums meanwhile
+      local saved_album current_album
+      saved_album="$(_album)"
+      current_album=$(_player_meta album || true)
+      [[ -z "$saved_album" || "$current_album" == "$saved_album" ]] || return 0
+      _player_is_playing || _player_play || return 0
+      _set_state playing "$saved_album"
+      ;;
+    held)
+      # paused by hand: stay quiet until the user presses play, then follow along
+      _player_is_playing || return 0
+      _set_state playing "$(_player_meta album || true)"
+      ;;
+    *)
+      # clangine turned on, or Spotify opened, while Claude is mid-turn: start
+      # what's loaded — but leave music you're already playing yourself alone
+      _player_is_playing && return 0
+      _player_play || return 0
+      _set_state playing "$(_player_meta album || true)"
+      ;;
+  esac
 }
 
 cmd_pause() {
   _is_enabled || return 0
+  [[ "$(_state)" == "playing" ]] || return 0
   _ensure_player
-  if [[ "$(_state)" == "playing" ]]; then
-    _player_pause
-    echo "paused:$(_album)" > "$STATE_FILE"
+  # Only remember a pause we actually made. If the user already paused by hand,
+  # hold off so the next hook doesn't resume it behind their back.
+  if _player_is_playing && _player_pause; then
+    _set_state paused "$(_album)"
+  elif _player_running; then
+    _set_state held "$(_album)"
+  else
+    _set_state stopped
   fi
 }
 
 cmd_stop() {
   _ensure_player
-  _player_pause
-  echo "stopped:" > "$STATE_FILE"
+  if _player_running; then
+    _player_pause || true
+  fi
+  # hooks won't restart playback until you press play again
+  _set_state held
 }
 
 cmd_skip() {
   _ensure_player
+  if ! _player_running; then
+    echo "clangine: $CLANGINE_PLAYER is not running" >&2
+    return 1
+  fi
   _player_next
 }
 
@@ -236,10 +376,11 @@ cmd_on() {
 
 cmd_off() {
   rm -f "$ENABLED_FILE"
-  if _player_running 2>/dev/null; then
+  # only pause music clangine is driving, not something you're playing by hand
+  if [[ "$(_state)" == "playing" ]] && _player_running 2>/dev/null; then
     _player_pause 2>/dev/null || true
   fi
-  echo "stopped:" > "$STATE_FILE"
+  _set_state stopped
   echo "clangine deactivated — Spotify will be left alone"
 }
 
@@ -259,10 +400,12 @@ cmd_status() {
   echo "active:   $(_is_enabled && echo yes || echo no)"
   echo "state:    $state"
   [[ -n "$album" ]] && echo "album:    $album"
+  [[ "$CLANGINE_OS" == "linux" ]] && echo "player:   $CLANGINE_PLAYER"
   if _player_running; then
     local track artist
-    track=$(_player_meta name 2>/dev/null || echo "unknown")
-    artist=$(_player_meta artist 2>/dev/null || echo "unknown")
+    track=$(_player_meta name || echo "unknown")
+    artist=$(_player_meta artist || echo "unknown")
+    echo "playback: $(_player_status)"
     echo "track:    $track"
     echo "artist:   $artist"
     if [[ -n "$CLANGINE_PLAYLIST" ]]; then
@@ -273,86 +416,52 @@ cmd_status() {
   fi
 }
 
+# jq definitions shared by install/uninstall: drop only the hook commands that
+# point at this clangine, and any matcher group left empty — other hooks on the
+# same events are preserved.
+JQ_STRIP_CLANGINE='
+  def strip_clangine:
+    map(.hooks = ((.hooks // []) | map(select((.command // "") | startswith($jp + " ") | not))))
+    | map(select(.hooks | length > 0));
+'
+
+_jq_install_hint() {
+  case "$CLANGINE_OS" in
+    macos) echo "brew install jq" ;;
+    *)     echo "sudo apt install jq   (or: sudo pacman -S jq / sudo dnf install jq)" ;;
+  esac
+}
+
 cmd_install() {
   local settings_file="$HOME/.claude/settings.json"
   local jukebox_path="$CLANGINE_DIR/clangine"
 
   mkdir -p "$HOME/.claude"
 
-  local settings
-  if [[ -f "$settings_file" ]]; then
-    settings="$(cat "$settings_file")"
-  else
-    settings="{}"
-  fi
+  local settings="{}"
+  [[ -s "$settings_file" ]] && settings="$(cat "$settings_file")"
 
   if ! command -v jq &>/dev/null; then
-    echo "jq is required for install. Install it with: brew install jq"
+    echo "jq is required for install. Install it with: $(_jq_install_hint)"
     echo ""
     echo "Or manually add these hooks to $settings_file:"
     _print_hooks_json "$jukebox_path"
     return 1
   fi
 
-  settings=$(echo "$settings" | jq --arg jp "$jukebox_path" '
-    .hooks.UserPromptSubmit = [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": ($jp + " play")
-          }
-        ]
-      }
-    ] |
-    .hooks.Stop = [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": ($jp + " pause")
-          }
-        ]
-      }
-    ] |
-    .hooks.Notification = [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": ($jp + " pause")
-          }
-        ]
-      }
-    ] |
-    .hooks.PermissionRequest = [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": ($jp + " pause")
-          }
-        ]
-      }
-    ] |
-    .hooks.PostToolUse = [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": ($jp + " play")
-          }
-        ]
-      }
-    ]
-  ')
+  # re-running install replaces our entries instead of duplicating them
+  settings=$(jq --arg jp "$jukebox_path" "$JQ_STRIP_CLANGINE"'
+    reduce (
+      {UserPromptSubmit: "play", PostToolUse: "play",
+       Stop: "pause", Notification: "pause", PermissionRequest: "pause"}
+      | to_entries[]
+    ) as $e (.;
+      .hooks[$e.key] = ((.hooks[$e.key] // []) | strip_clangine)
+        + [{matcher: "", hooks: [{type: "command", command: ($jp + " " + $e.value)}]}]
+    )
+  ' <<<"$settings")
 
-  echo "$settings" | jq '.' > "$settings_file"
+  echo "$settings" > "$settings_file"
   echo "Hooks installed in $settings_file"
   echo ""
   echo "Events wired:"
@@ -365,6 +474,7 @@ cmd_install() {
 
 cmd_uninstall() {
   local settings_file="$HOME/.claude/settings.json"
+  local jukebox_path="$CLANGINE_DIR/clangine"
 
   if [[ ! -f "$settings_file" ]]; then
     echo "No settings file found at $settings_file"
@@ -372,21 +482,19 @@ cmd_uninstall() {
   fi
 
   if ! command -v jq &>/dev/null; then
-    echo "jq required. Manually remove the hooks from $settings_file"
+    echo "jq required ($(_jq_install_hint)). Manually remove the clangine hooks from $settings_file"
     return 1
   fi
 
   local settings
-  settings=$(cat "$settings_file" | jq '
-    del(.hooks.UserPromptSubmit) |
-    del(.hooks.Stop) |
-    del(.hooks.Notification) |
-    del(.hooks.PermissionRequest) |
-    del(.hooks.PostToolUse) |
-    if .hooks == {} then del(.hooks) else . end
-  ')
+  settings=$(jq --arg jp "$jukebox_path" "$JQ_STRIP_CLANGINE"'
+    if .hooks then
+      .hooks |= (map_values(strip_clangine) | with_entries(select(.value | length > 0)))
+      | if .hooks == {} then del(.hooks) else . end
+    else . end
+  ' "$settings_file")
 
-  echo "$settings" | jq '.' > "$settings_file"
+  echo "$settings" > "$settings_file"
   echo "Hooks removed from $settings_file"
   cmd_stop 2>/dev/null || true
 }
@@ -424,11 +532,12 @@ case "$cmd" in
   play)
     payload="$(_read_payload)"
     _is_self_trigger "$payload" && exit 0
-    if _from_hook "$payload"; then cmd_resume; else cmd_play; fi
+    if _from_hook "$payload"; then CLANGINE_HOOK=1; cmd_resume; else cmd_play; fi
     ;;
   pause)
     payload="$(_read_payload)"
     _skip_turn_end_pause "$payload" && exit 0
+    _from_hook "$payload" && CLANGINE_HOOK=1
     cmd_pause
     ;;
   stop)      cmd_stop ;;
@@ -450,7 +559,7 @@ case "$cmd" in
     echo "  toggle     Toggle activation"
     echo "  play       Start/resume playback"
     echo "  pause      Pause playback"
-    echo "  stop       Stop and reset"
+    echo "  stop       Pause; hooks stay quiet until you press play"
     echo "  skip       Next track"
     echo "  status     Show current state"
     echo "  install    Add hooks to Claude Code settings"
